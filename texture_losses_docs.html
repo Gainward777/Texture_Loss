@@ -1,0 +1,303 @@
+
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Документация: texture_losses.py</title>
+<style>
+  :root { --fg:#0f172a; --muted:#475569; --bg:#ffffff; --code:#0b1021; --accent:#0ea5e9; }
+  html,body { margin:0; padding:0; background:var(--bg); color:var(--fg); font: 16px/1.55 system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial, sans-serif; }
+  header { padding: 32px 24px 16px; border-bottom:1px solid #e2e8f0; }
+  h1 { margin:0 0 6px; font-size: 28px; }
+  h2 { margin:28px 0 12px; font-size:22px; }
+  h3 { margin:22px 0 8px; font-size:18px; }
+  p, li { color: var(--fg); }
+  small, .muted { color: var(--muted); }
+  main { max-width: 1000px; margin: 0 auto; padding: 24px; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+  code { background:#f8fafc; padding:2px 6px; border-radius:6px; }
+  pre { background:#0b1021; color:#e5e7eb; padding:16px; border-radius:12px; overflow:auto; }
+  pre code { background:transparent; padding:0; }
+  .card { background:#fff; border:1px solid #e2e8f0; border-radius:14px; padding:16px 18px; margin:16px 0; }
+  .grid { display:grid; gap:16px; grid-template-columns: repeat(12, 1fr); }
+  .grid > * { grid-column: span 12; }
+  @media (min-width: 860px) {
+    .grid-6 { grid-column: span 6; }
+  }
+  table { width:100%; border-collapse: collapse; margin: 8px 0 18px; }
+  th, td { text-align:left; padding:10px 12px; border-bottom:1px solid #e2e8f0; vertical-align: top; }
+  th { background:#f8fafc; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .kbd { border:1px solid #cbd5e1; padding:2px 6px; border-radius:6px; background:#f8fafc; font-family:inherit; }
+  .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#ecfeff; color:#0369a1; font-size:12px; margin-left:6px; }
+  .note { border-left:4px solid #bae6fd; background:#f0f9ff; padding:10px 12px; border-radius:8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Документация модуля <code>texture_losses.py</code></h1>
+  <p class="muted">Лоссы для стабилизации масштаба тайлинга (плитка/кирпич) при замене материала на изображении.</p>
+</header>
+<main>
+<section id="overview">
+  <h2>Обзор</h2>
+  <p>Модуль содержит набор дифференцируемых функций потерь, которые адресно воздействуют на <strong>масштаб (период)</strong> периодической текстуры и минимально затрагивают её фактуру. Это достигается через сравнение признаков в частотной области (радиально‑усреднённые спектры, лог‑полярные карты) и через автокорреляцию.</p>
+  <div class="card">
+    <strong>Состав:</strong>
+    <ul>
+      <li><code>SpectralPeriodLoss</code> — попадание в основной частотный пик + узкополосное согласование формы спектра.</li>
+      <li><code>LogPolarAlignLoss</code> — выравнивание амплитудных спектров в лог‑полярных координатах (масштаб/угол → сдвиги).</li>
+      <li><code>ScaleConsistencyLoss</code> — консистентность масштаба между двумя стохастическими прогонами при одинаковых условиях.</li>
+      <li><code>ACFPeriodLoss</code> — сравнение периодов по первому пику радиального профиля автокорреляции (через теорему Винера–Хинчина).</li>
+    </ul>
+  </div>
+</section>
+
+<section id="conventions">
+  <h2>Общие соглашения</h2>
+  <ul>
+    <li><strong>Типы и формы входов:</strong>
+      <ul>
+        <li><code>pred</code>, <code>target</code>: <code>torch.Tensor</code> формы <code>B&times;C&times;H&times;W</code>, где <code>C</code> — 1 или 3 канала; <code>dtype=float32</code>, как правило в диапазоне <code>[0,1]</code>.</li>
+        <li><code>mask</code>: <code>torch.Tensor</code> формы <code>B&times;1&times;H&times;W</code>, <code>dtype=float32</code> в <code>[0,1]</code> (может быть «мягкой»). Используется для аподизации перед БПФ.</li>
+      </ul>
+    </li>
+    <li><strong>Преобразование в яркость:</strong> если вход 3‑канальный, внутри лоссов берётся luma (яркостный канал) — это снижает чувствительность к цвету и экспозиции.</li>
+    <li><strong>Частотные операции:</strong> используются <code>torch.fft.fft2</code>/<code>ifft2</code> и <code>fftshift</code>; лог‑полярная выборка реализована через <code>torch.nn.functional.grid_sample</code>; масштабирование — через <code>torch.nn.functional.interpolate</code>.</li>
+    <li><strong>Численная устойчивость:</strong> во всех логарифмах и делениях используется малое <code>EPS</code>.</li>
+  </ul>
+  <div class="note">
+    <strong>Сложность:</strong> доминирует 2D БПФ: примерно <code>O(B·H·W·log(HW))</code> на батч.
+  </div>
+</section>
+
+<section id="api">
+  <h2>API: Классы лоссов</h2>
+
+  <article id="spectralperiodloss">
+    <h3><code>SpectralPeriodLoss</code></h3>
+    <p><em>Идея:</em> выравнивает основной частотный пик (задаёт период) и «подтягивает» форму спектра в узкой полосе вокруг целевого периода. В остальном спектр (а значит и фактура) почти не штрафуется.</p>
+    <div class="card">
+      <strong>Сигнатуры</strong>
+      <pre><code>class SpectralPeriodLoss(torch.nn.Module):
+    def __init__(
+        self,
+        r_bins: int = 256,
+        tau: float = 0.06,
+        band_sigma: float = 0.15,
+        w_peak: float = 1.0,
+        w_band: float = 1.0,
+        min_bin: int = 2,
+        max_bin: int | None = None
+    ): ...
+
+    def forward(
+        self,
+        pred:   torch.Tensor,   # B×{1|3}×H×W, float32
+        target: torch.Tensor,   # B×{1|3}×H×W, float32
+        mask:   torch.Tensor,   # B×1×H×W,    float32 in [0,1]
+        center_override: torch.Tensor | None = None  # B, нормированная частота [0,1]
+    ) -> torch.Tensor:          # scalar, float32
+</code></pre>
+    </div>
+    <div class="grid">
+      <div class="grid-6">
+        <h4>Входы</h4>
+        <table>
+          <thead><tr><th>Параметр</th><th>Тип / Формат</th><th>Описание</th></tr></thead>
+          <tbody>
+            <tr><td><code>pred</code></td><td><code>torch.Tensor</code><br/>B&times;{1|3}&times;H&times;W, float32</td><td>Предсказанное изображение (внутри берётся luma).</td></tr>
+            <tr><td><code>target</code></td><td><code>torch.Tensor</code><br/>B&times;{1|3}&times;H&times;W, float32</td><td>Целевое изображение.</td></tr>
+            <tr><td><code>mask</code></td><td><code>torch.Tensor</code><br/>B&times;1&times;H&times;W, float32 в [0,1]</td><td>Область замены материала; используется для аподизации перед БПФ.</td></tr>
+            <tr><td><code>center_override</code></td><td><code>torch.Tensor</code> формы B или <code>None</code></td><td>Опциональный центр узкой полосы как нормированная частота [0,1] (например из глубины/приора).</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="grid-6">
+        <h4>Выход</h4>
+        <table>
+          <thead><tr><th>Тип</th><th>Формат</th><th>Значение</th></tr></thead>
+          <tbody>
+            <tr><td><code>torch.Tensor</code></td><td>скаляр, float32</td><td>Значение лосса, усреднённое по батчу; пригодно для <code>backward()</code>.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <p><strong>Примечания:</strong> радиальные профили строятся по амплитуде БПФ; пик оценивается через дифференцируемый <em>soft-argmax</em>; узкополосная часть сравнивает лог‑амплитуды (устойчивее к экспозиции).</p>
+  </article>
+
+  <article id="logpolaralignloss">
+    <h3><code>LogPolarAlignLoss</code></h3>
+    <p><em>Идея:</em> переводим амплитудные спектры в лог‑полярные карты (масштаб и угол становятся сдвигами) и минимизируем MSE между ними.</p>
+    <div class="card">
+      <strong>Сигнатуры</strong>
+      <pre><code>class LogPolarAlignLoss(torch.nn.Module):
+    def __init__(self, out_r: int = 128, out_t: int = 180, r_min: float = 1e-2, w: float = 1.0): ...
+
+    def forward(
+        self,
+        pred:   torch.Tensor,   # B×{1|3}×H×W, float32
+        target: torch.Tensor,   # B×{1|3}×H×W, float32
+        mask:   torch.Tensor    # B×1×H×W,    float32
+    ) -> torch.Tensor:          # scalar, float32
+</code></pre>
+    </div>
+    <div class="grid">
+      <div class="grid-6">
+        <h4>Входы</h4>
+        <table>
+          <thead><tr><th>Параметр</th><th>Тип / Формат</th><th>Описание</th></tr></thead>
+          <tbody>
+            <tr><td><code>pred</code>, <code>target</code></td><td><code>torch.Tensor</code><br/>B&times;{1|3}&times;H&times;W, float32</td><td>Изображения; внутри берётся luma, затем БПФ (амплитуда) и лог‑полярное отображение.</td></tr>
+            <tr><td><code>mask</code></td><td><code>torch.Tensor</code><br/>B&times;1&times;H&times;W, float32</td><td>Аподизация области материала перед БПФ.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="grid-6">
+        <h4>Выход</h4>
+        <table>
+          <thead><tr><th>Тип</th><th>Формат</th><th>Значение</th></tr></thead>
+          <tbody>
+            <tr><td><code>torch.Tensor</code></td><td>скаляр, float32</td><td>MSE между лог‑амплитудами лог‑полярных карт (среднее по батчу).</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <p><strong>Примечания:</strong> лог‑полярная выборка выполняется через <code>grid_sample</code> (координаты сетки — в диапазоне [-1,1]).</p>
+  </article>
+
+  <article id="scaleconsistencyloss">
+    <h3><code>ScaleConsistencyLoss</code></h3>
+    <p><em>Идея:</em> для стабилизации масштаба между стохастическими прогонами (разные сиды/шумы) штрафуется различие основных частотных пиков (в лог‑шкале).</p>
+    <div class="card">
+      <strong>Сигнатуры</strong>
+      <pre><code>class ScaleConsistencyLoss(torch.nn.Module):
+    def __init__(self, r_bins: int = 256, tau: float = 0.06, min_bin: int = 2, max_bin: int | None = None, w: float = 1.0): ...
+
+    def forward(
+        self,
+        pred1:  torch.Tensor,   # B×{1|3}×H×W, float32
+        pred2:  torch.Tensor,   # B×{1|3}×H×W, float32
+        mask:   torch.Tensor    # B×1×H×W,    float32
+    ) -> torch.Tensor:          # scalar, float32
+</code></pre>
+    </div>
+    <div class="grid">
+      <div class="grid-6">
+        <h4>Входы</h4>
+        <table>
+          <thead><tr><th>Параметр</th><th>Тип / Формат</th><th>Описание</th></tr></thead>
+          <tbody>
+            <tr><td><code>pred1</code>, <code>pred2</code></td><td><code>torch.Tensor</code><br/>B&times;{1|3}&times;H&times;W, float32</td><td>Два предсказания при одинаковых условиях (разные seeds/шумы).</td></tr>
+            <tr><td><code>mask</code></td><td><code>torch.Tensor</code><br/>B&times;1&times;H&times;W, float32</td><td>Область материала.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="grid-6">
+        <h4>Выход</h4>
+        <table>
+          <thead><tr><th>Тип</th><th>Формат</th><th>Значение</th></tr></thead>
+          <tbody>
+            <tr><td><code>torch.Tensor</code></td><td>скаляр, float32</td><td>Абсолютная разница лог‑частот пиков (усреднённая по батчу).</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </article>
+
+  <article id="acfperiodloss">
+    <h3><code>ACFPeriodLoss</code></h3>
+    <p><em>Идея:</em> период оценивается по первому значимому пику радиального профиля автокорреляции (ACF), которую получаем как обратное БПФ от спектра мощности (теорема Винера–Хинчина).</p>
+    <div class="card">
+      <strong>Сигнатуры</strong>
+      <pre><code>class ACFPeriodLoss(torch.nn.Module):
+    def __init__(self, r_bins: int = 256, tau: float = 0.08, min_rel: float = 0.03, max_rel: float = 0.6, w: float = 1.0): ...
+
+    def forward(
+        self,
+        pred:   torch.Tensor,   # B×{1|3}×H×W, float32
+        target: torch.Tensor,   # B×{1|3}×H×W, float32
+        mask:   torch.Tensor    # B×1×H×W,    float32
+    ) -> torch.Tensor:          # scalar, float32
+</code></pre>
+    </div>
+    <div class="grid">
+      <div class="grid-6">
+        <h4>Входы</h4>
+        <table>
+          <thead><tr><th>Параметр</th><th>Тип / Формат</th><th>Описание</th></tr></thead>
+          <tbody>
+            <tr><td><code>pred</code>, <code>target</code></td><td><code>torch.Tensor</code><br/>B&times;{1|3}&times;H&times;W, float32</td><td>Изображения; внутри вычисляются PSD и ACF.</td></tr>
+            <tr><td><code>mask</code></td><td><code>torch.Tensor</code><br/>B&times;1&times;H&times;W, float32</td><td>Аподизация области материала перед БПФ.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="grid-6">
+        <h4>Выход</h4>
+        <table>
+          <thead><tr><th>Тип</th><th>Формат</th><th>Значение</th></tr></thead>
+          <tbody>
+            <tr><td><code>torch.Tensor</code></td><td>скаляр, float32</td><td>Абсолютная разница лог‑радиальных позиций первых пиков ACF (среднее по батчу).</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </article>
+</section>
+
+<section id="usage">
+  <h2>Пример использования</h2>
+  <pre><code>from texture_losses import (
+    SpectralPeriodLoss, LogPolarAlignLoss,
+    ScaleConsistencyLoss, ACFPeriodLoss
+)
+import torch
+import torch.nn.functional as F
+
+# pred/target/mask: torch.Tensor, формы B×C×H×W (C∈{1,3}) и B×1×H×W
+spec = SpectralPeriodLoss(r_bins=256, w_peak=0.1, w_band=0.05)
+lp   = LogPolarAlignLoss(out_r=128, out_t=180, r_min=1e-2, w=0.02)
+sc   = ScaleConsistencyLoss(r_bins=256, w=0.05)
+acf  = ACFPeriodLoss(r_bins=256, w=0.02)
+
+L_rec  = F.mse_loss(pred * mask, target * mask)
+L_spec = spec(pred, target, mask)       # scalar float32
+L_lp   = lp(pred, target, mask)         # scalar float32
+L_sc   = sc(pred1, pred2, mask)         # scalar float32 (два прогона)
+L_acf  = acf(pred, target, mask)        # scalar float32
+
+loss = L_rec + L_spec + L_lp + L_sc + L_acf
+loss.backward()
+</code></pre>
+</section>
+
+<section id="notes">
+  <h2>Практические примечания</h2>
+  <ul>
+    <li><strong>Совпадение размеров:</strong> <code>pred</code>, <code>target</code>, <code>mask</code> должны иметь одинаковые <code>B</code>, <code>H</code>, <code>W</code>.</li>
+    <li><strong>DC‑компонента и хвост:</strong> профили обрезают первые бины и далёкий хвост, чтобы исключить паразитные влияния.</li>
+    <li><strong>AMP:</strong> из‑за логарифмов и БПФ надёжнее держать вычисления в <code>float32</code> или использовать autocast c принудительным <code>float32</code> в критичных местах.</li>
+    <li><strong>Интерполяция/сэмплинг:</strong> используйте <code>nearest</code> для бинарных масок и <code>bilinear</code> для непрерывных карт.</li>
+  </ul>
+</section>
+
+<section id="refs">
+  <h2>Ссылки</h2>
+  <ul>
+    <li>PyTorch FFT: <a href="https://docs.pytorch.org/docs/stable/fft.html" target="_blank" rel="noopener">torch.fft — Fast Fourier Transforms</a></li>
+    <li><code>torch.fft.fft2</code>: <a href="https://docs.pytorch.org/docs/stable/generated/torch.fft.fft2.html" target="_blank" rel="noopener">документация</a></li>
+    <li><code>torch.fft.ifft2</code>: <a href="https://docs.pytorch.org/docs/stable/generated/torch.fft.ifft2.html" target="_blank" rel="noopener">документация</a></li>
+    <li><code>torch.nn.functional.grid_sample</code>: <a href="https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.grid_sample.html" target="_blank" rel="noopener">документация</a></li>
+    <li><code>torch.nn.functional.interpolate</code>: <a href="https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.interpolate.html" target="_blank" rel="noopener">документация</a></li>
+    <li>Теорема Винера–Хинчина: <a href="https://en.wikipedia.org/wiki/Wiener%E2%80%93Khinchin_theorem" target="_blank" rel="noopener">Wikipedia</a> / <a href="https://www.comm.toronto.edu/frank/notes/wk.pdf" target="_blank" rel="noopener">конспект U&nbsp;Toronto (PDF)</a></li>
+  </ul>
+</section>
+
+<footer class="muted" style="padding:24px;">
+  <p>&copy; 2025. Документация для модуля <code>texture_losses.py</code>. Подходит для прямого подключения в проект.</p>
+</footer>
+</main>
+</body>
+</html>
