@@ -25,16 +25,36 @@ __all__ = [
     "ScaleConsistencyLoss",
     "ACFPeriodLoss",
 ]
+"""
+Комментрий на основе эмпирического опыта
+В качестве основы используем SpectralPeriodLoss. Именно данный тип лоссов наиболее сильно влияет на обучение. 
+Помимо этого с малыми весами также используем LogPolarAlignLoss и ACFPeriodLoss. Если их дополнительно добавляем к SpectralPeriodLoss,
+помогает модели при обучении сохранять тайтлинг. Очень было заметно это.
 
+При обучении текстурные лоссы добавляю к основным с переменным коэффициентом. Пока это на стадии тестирования. Не могу ничего точно сказать
+как и что лучше себя показывает.
+"""
 
 class SpectralPeriodLoss(torch.nn.Module):
     """
     A) Попадание в основной частотный пик + узкополосное согласование спектра.
     Стабилизирует масштаб тайлинга, почти не трогая фактуру.
     """
-    def __init__(self, r_bins: int = 256, tau: float = 0.06, band_sigma: float = 0.15,
-                 w_peak: float = 1.0, w_band: float = 1.0,
-                 min_bin: int = 2, max_bin: int | None = None):
+
+    # Комментарий от Дмитрия:
+    # Очень классно проработанная функция подсчёта лоссов, которая хорошо себя показывает.
+    # Её используем в качестве основы для текстурных лоссов, удобно играться с параметрами.
+
+    def __init__(
+        self,
+        r_bins: int = 256,
+        tau: float = 0.06,
+        band_sigma: float = 0.15,
+        w_peak: float = 1.0,
+        w_band: float = 1.0,
+        min_bin: int = 2,
+        max_bin: int | None = None,
+    ):
         super().__init__()
         self.r_bins = r_bins
         self.tau = tau
@@ -44,37 +64,70 @@ class SpectralPeriodLoss(torch.nn.Module):
         self.min_bin = min_bin
         self.max_bin = max_bin
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor,
-                center_override: torch.Tensor | None = None) -> torch.Tensor:
+        grid = (torch.arange(r_bins).float() + 0.5) / r_bins  # (R,)
+        self.register_buffer("grid", grid)
+
+    def _max_bin(self) -> int:
+        return self.max_bin if self.max_bin is not None else self.r_bins - 1
+
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        mask: torch.Tensor,
+        center_override: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # Переводим в яркость
         I = rgb_to_luma(pred)
         T = rgb_to_luma(target)
+
+        # Амплитудные спектры
         A_pred = fft_amp(I, mask)
         A_tgt = fft_amp(T, mask)
 
-        Sg = radial_profile(A_pred, r_bins=self.r_bins, min_bin=self.min_bin,
-                            max_bin=self.max_bin if self.max_bin is not None else self.r_bins - 1)
-        St = radial_profile(A_tgt, r_bins=self.r_bins, min_bin=self.min_bin,
-                            max_bin=self.max_bin if self.max_bin is not None else self.r_bins - 1)
+        max_bin = self._max_bin()
 
-        fg_idx, fg = soft_peak(Sg, tau=self.tau, lo=self.min_bin,
-                               hi=self.max_bin if self.max_bin is not None else self.r_bins - 1)
-        ft_idx, ft = soft_peak(St, tau=self.tau, lo=self.min_bin,
-                               hi=self.max_bin if self.max_bin is not None else self.r_bins - 1)
+        # Радиальные профили спектров
+        Sg = radial_profile(
+            A_pred,
+            r_bins=self.r_bins,
+            min_bin=self.min_bin,
+            max_bin=max_bin,
+        )
+        St = radial_profile(
+            A_tgt,
+            r_bins=self.r_bins,
+            min_bin=self.min_bin,
+            max_bin=max_bin,
+        )
 
+        # Мягкий поиск основного частотного пика
+        _, fg = soft_peak(Sg, tau=self.tau, lo=self.min_bin, hi=max_bin)
+        _, ft = soft_peak(St, tau=self.tau, lo=self.min_bin, hi=max_bin)
+
+        # Лосс по пику (по лог-амплитуде)
         l_peak = (torch.log(fg + _EPS) - torch.log(ft + _EPS)).abs().mean()
 
+        # Центр полосы: либо таргетный пик, либо явно заданный override
         if center_override is None:
-            c = ft.detach()  # B, 0..1
+            c = ft.detach()  # (B,), в [0, 1]
         else:
-            c = center_override.clamp(1e-3, 1 - 1e-3)
+            c = center_override
+        c = c.clamp(1e-3, 1 - 1e-3)
 
-        grid = (torch.arange(self.r_bins, device=pred.device, dtype=pred.dtype) + 0.5) / self.r_bins
-        w = torch.exp(-(torch.log(grid + _EPS)[None, :] - torch.log(c[:, None] + _EPS)) ** 2 / (2 * self.band_sigma ** 2))
+        # Гауссовское окно в лог-пространстве частот вокруг центра c
+        grid = self.grid.to(dtype=pred.dtype)  # (R,)
+        log_grid = torch.log(grid + _EPS)[None, :]        # (1, R)
+        log_c = torch.log(c + _EPS)[:, None]              # (B, 1)
+
+        w = torch.exp(-(log_grid - log_c) ** 2 / (2 * self.band_sigma ** 2))  # (B, R)
         w = w / (w.sum(dim=-1, keepdim=True) + _EPS)
 
+        # Узкополосное согласование спектров
         l_band = (w * (Sg - St).abs()).sum(dim=-1).mean()
 
         return self.w_peak * l_peak + self.w_band * l_band
+
 
 
 class LogPolarAlignLoss(torch.nn.Module):
