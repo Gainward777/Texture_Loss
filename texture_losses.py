@@ -5,6 +5,7 @@ texture_losses.py
 Зависимости: torch; внутренние утилиты из texture_helpers.py
 """
 from __future__ import annotations
+from phase_correlation_loss import PhaseCorrelationLoss
 
 import torch
 import torch.nn.functional as F
@@ -24,6 +25,7 @@ __all__ = [
     "LogPolarAlignLoss",
     "ScaleConsistencyLoss",
     "ACFPeriodLoss",
+    "PhaseCorrelationLoss",   # ← added
 ]
 
 
