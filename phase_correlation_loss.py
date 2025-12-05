@@ -12,6 +12,16 @@ phase_correlation_loss.py
   - Практика: OpenCV phaseCorrelate — Ханново окно, кросс-спектр, ifft (корр-карта).
   - PCE (peak-to-correlation energy) — стандартная метрика «одиночности» пика.
 
+Пример использования
+# начните с небольшого веса фазовой корреляции
+loss = L_rec + L_spec + L_lp + L_acf + 0.05 * L_pcl
+loss.backward()
+
+# --- лог диагностики (раз в N шагов):
+with torch.no_grad():
+    diag = pcl.diagnostics(pred, target, mask)
+    print(f"PCL diag: center_prob={diag['center_prob']:.3f}  PCE={diag['PCE']:.2f}"
+
 """
 from __future__ import annotations
 from typing import Dict, Tuple
