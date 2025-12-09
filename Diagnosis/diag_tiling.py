@@ -1,33 +1,42 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Диагностика тайлинга периодических текстур на изображениях.
+diag_tiling.py — диагностика тайлинга периодических текстур на изображениях.
 
 Что делает:
-  • Глобальный 2D-спектр (с/без окна Ханна), радиальный профиль и оценки f, 2f, 0.5f
-  • ACF (автокорреляция) и период по первому пику
-  • "Осевой крест" в FFT (axis energy ratio)
+  • Глобальный 2D-спектр (Hann/без окна), радиальный профиль и оценка фундаментала f*
+  • Энергии вокруг f*, 2f*, 0.5f* (E2f/Ef, Ehalf/Ef)
+  • ACF через PSD (Винер–Хинчин) и первый значимый пик
+  • «Осевой крест» FFT (axis energy ratio)
   • Карта локального периода (скользящее окно)
-  • 1px shift-sensitivity (MSE при сдвиге по x/y)
-  • Resize sanity (down→up с AA) и изменение фундаментала
-  • JSON-отчёт + PNG-графики; есть функция вызова из тренировки
+  • Детектор «полос удвоения» поперёк направления перспективы
+  • Shift-sensitivity (MSE при сдвиге 1 px по X/Y)
+  • Resize sanity (down→up с AA) и сдвиг f*
+  • JSON-отчёт + PNG-графики; есть API для вызова из тренировки
 
-Зависимости: torch, torchvision, numpy, pillow, matplotlib
+Зависимости: torch, numpy, pillow, matplotlib
+(Опционально: torchvision — не требуется для работы файла.)
 
-Примечание по FFT/окну:
-  - 2D FFT берём из torch.fft (fft2/ifft2/fftshift) — стандартные API PyTorch.  :contentReference[oaicite:0]{index=0}
-  - Ханново окно помогает подавить краевые/осевые артефакты при FFT.           :contentReference[oaicite:1]{index=1}
-  - ACF считаем из PSD через теорему Винера–Хинчина.                            :contentReference[oaicite:2]{index=2}
-  - Для sanity ресайза используйте антиалиас (torchvision Resize antialias).    :contentReference[oaicite:3]{index=3}
+Справки:
+  • torch.fft.fft2/ifft2/fftshift — 2D БПФ в PyTorch.            (docs)        # noqa
+  • torch.hann_window — оконная функция Ханна.                    (docs)        # noqa
+  • Теорема Винера–Хинчина — ACF ↔ PSD.                           (theory)      # noqa
+  • Checkerboard от deconv и фикс resize→conv.                    (Odena et al.)# noqa
+  • Anti-aliased CNNs / BlurPool для сдвиговой устойчивости.      (Zhang 2019)  # noqa
 """
 
 from __future__ import annotations
-import argparse, json, math, os
+
+import argparse
+import json
+import math
+import os
 from dataclasses import dataclass
-from typing import Dict, Tuple, Optional
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 from PIL import Image
+
 import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
@@ -64,7 +73,7 @@ def rgb_to_luma(t: torch.Tensor) -> torch.Tensor:
 
 
 def hann2d(h: int, w: int, device=None, dtype=None) -> torch.Tensor:
-    """2D Hann window (outer product). Снижает утечки/осевой крест на FFT. :contentReference[oaicite:4]{index=4}"""
+    """2D Hann window (outer product). Снижает утечки/осевой крест на FFT."""
     win_h = torch.hann_window(h, periodic=False, device=device, dtype=dtype)
     win_w = torch.hann_window(w, periodic=False, device=device, dtype=dtype)
     return (win_h[:, None] * win_w[None, :]).clamp_min(EPS)
@@ -73,7 +82,7 @@ def hann2d(h: int, w: int, device=None, dtype=None) -> torch.Tensor:
 # ---------------------------- FFT / profiles ---------------------------------
 def fft_amp(y: torch.Tensor) -> torch.Tensor:
     """1xHxW -> HxW амплитуда FFT (центрованная)."""
-    Y = torch.fft.fft2(y, norm="ortho")  # 2D DFT по последним двум осям :contentReference[oaicite:5]{index=5}
+    Y = torch.fft.fft2(y, norm="ortho")  # 2D DFT по последним двум осям
     A = torch.abs(Y).squeeze(0)          # HxW
     A = torch.fft.fftshift(A, dim=(-2, -1))
     return A
@@ -86,7 +95,7 @@ def power_spectrum(y: torch.Tensor) -> torch.Tensor:
 
 
 def autocorr_from_psd(psd: torch.Tensor) -> torch.Tensor:
-    """H×W PSD -> H×W ACF (центр в середине). Теорема Винера–Хинчина. :contentReference[oaicite:6]{index=6}"""
+    """H×W PSD -> H×W ACF (центр в середине). Теорема Винера–Хинчина."""
     psd_shifted = torch.fft.ifftshift(psd, dim=(-2, -1))
     ac = torch.fft.ifft2(psd_shifted, norm="ortho").real
     ac = torch.fft.fftshift(ac, dim=(-2, -1))
@@ -150,17 +159,19 @@ def estimate_fundamental(y_luma: torch.Tensor, mask: torch.Tensor, cfg: DiagConf
     return r_star.item(), (radii.cpu().numpy(), prof.cpu().numpy())
 
 
-def energy_at_radius(A_log: torch.Tensor, r_star: float, ring_w: int, radii: torch.Tensor) -> Tuple[float, float, float]:
+def energy_at_radius(A_log: torch.Tensor, r_star: float, ring_w: int, radii_ref: torch.Tensor) -> Tuple[float, float, float]:
     """E(f), E(2f), E(0.5f) из лог-амплитуды (устойчивей к экспозиции)."""
-    def window(center_r):
-        w = torch.exp(- (radii - center_r)**2 / (2 * (ring_w ** 2)))
+    # пересчитаем профиль на том же числе бинов, что и при оценке r_star
+    n_bins = int(len(radii_ref))
+    rad, prof = radial_profile(A_log, n_bins)
+    # окна по радиусу вокруг f, 2f, 0.5f
+    def window(center_r: float):
+        w = torch.exp(- (rad - center_r)**2 / (2 * (ring_w ** 2)))
         w = w / (w.sum() + EPS)
         return w
     w_f  = window(r_star)
-    w_2f = window(min(2 * r_star, radii[-1].item()))
-    w_hf = window(max(0.5 * r_star, radii[1].item()))
-    # построим профиль для текущей A_log
-    rad, prof = radial_profile(A_log, len(radii))
+    w_2f = window(min(2 * r_star, rad[-1].item()))
+    w_hf = window(max(0.5 * r_star, rad[1].item()))
     Ef  = float((w_f  * prof).sum().item())
     E2f = float((w_2f * prof).sum().item())
     Ehf = float((w_hf * prof).sum().item())
@@ -232,45 +243,193 @@ def roll_mse(y: torch.Tensor, mask: torch.Tensor, dx: int, dy: int) -> float:
 
 
 def resize_sanity(y: torch.Tensor, mask: torch.Tensor, scale=0.5) -> Tuple[float, float]:
-    """down (AA) → up, MSE и сдвиг фундаментала (по радиусам). Антиалиас обязателен. :contentReference[oaicite:7]{index=7}"""
+    """down (AA) → up, MSE и сдвиг фундаментала (по радиусам)."""
     C, H, W = y.shape
-    y_img = (y.clamp(0, 1).permute(1,2,0).cpu().numpy() * 255).astype(np.uint8)
-    y_pil = Image.fromarray(y_img.squeeze() if C==1 else y_img, mode="L" if C==1 else "RGB")
-    down = y_pil.resize((int(W*scale), int(H*scale)), Image.BICUBIC)
-    up   = down.resize((W, H), Image.BICUBIC)
+    y_img = (y.clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+    y_pil = Image.fromarray(y_img.squeeze() if C == 1 else y_img, mode="L" if C == 1 else "RGB")
+    down = y_pil.resize((int(W * scale), int(H * scale)), Image.BICUBIC)  # PIL bicubic — c AA
+    up = down.resize((W, H), Image.BICUBIC)
     up_t = torch.from_numpy(np.asarray(up).astype(np.float32) / 255.0)
-    if C == 1: up_t = up_t[None, ...]
-    else:      up_t = up_t.permute(2,0,1)
+    if C == 1:
+        up_t = up_t[None, ...]
+    else:
+        up_t = up_t.permute(2, 0, 1)
     mse = float((((y - up_t) ** 2) * mask).sum() / (mask.sum() + EPS))
     r_pred, _ = estimate_fundamental(rgb_to_luma(y), mask, DiagConfig(""), use_hann=True)
-    r_up, _   = estimate_fundamental(rgb_to_luma(up_t), mask, DiagConfig(""), use_hann=True)
+    r_up, _ = estimate_fundamental(rgb_to_luma(up_t), mask, DiagConfig(""), use_hann=True)
     return mse, float(r_up - r_pred)
+
+
+# ---------------------------- banding diagnostics ----------------------------
+def _line_stats(vec: np.ndarray) -> dict:
+    """
+    vec: 1D со значениями по строкам или столбцам (может содержать NaN).
+    Возвращает наклон линейной регрессии и R^2 (без NaN).
+    """
+    x = np.arange(len(vec), dtype=np.float32)
+    m = np.isfinite(vec)
+    if m.sum() < 3:
+        return {"slope": 0.0, "r2": 0.0}
+    xv, yv = x[m], vec[m].astype(np.float32)
+    xmean, ymean = xv.mean(), yv.mean()
+    denom = ((xv - xmean) ** 2).sum() + 1e-8
+    slope = ((xv - xmean) * (yv - ymean)).sum() / denom
+    r2 = (((xv - xmean) * slope + ymean - yv) ** 2).sum()
+    tot = ((yv - ymean) ** 2).sum() + 1e-8
+    r2 = 1.0 - (r2 / tot)
+    return {"slope": float(slope), "r2": float(max(0.0, min(1.0, r2)))}
+
+
+def _rowcol_medians(lp_map: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Медианы локального периода по строкам и столбцам (игнорируя NaN)."""
+    row_med = np.nanmedian(lp_map, axis=1)  # H
+    col_med = np.nanmedian(lp_map, axis=0)  # W
+    return row_med, col_med
+
+
+def detect_perspective_axis(lp_map: np.ndarray) -> dict:
+    """
+    Оценивает, вдоль какой оси период меняется сильнее (приближённо «направление перспективы»).
+    Возвращает: {'axis': 'x' или 'y', 'row_slope','row_r2','col_slope','col_r2'}
+    """
+    row_med, col_med = _rowcol_medians(lp_map)
+    rs = _line_stats(row_med)
+    cs = _line_stats(col_med)
+    score_row = abs(rs["slope"]) * rs["r2"]
+    score_col = abs(cs["slope"]) * cs["r2"]
+    axis = "y" if score_row >= score_col else "x"
+    return {"axis": axis, "row_slope": rs["slope"], "row_r2": rs["r2"],
+            "col_slope": cs["slope"], "col_r2": cs["r2"]}
+
+
+def _make_2x_mask(lp_map: np.ndarray, tol: float = 0.2) -> tuple[np.ndarray, float]:
+    """
+    Базовый период = медиана по всей карте (по finite значениям).
+    Пиксель помечаем как 2×, если lp ∈ [ (2-tol)*base, (2+tol)*base ].
+    """
+    base = np.nanmedian(lp_map)
+    lo, hi = (2.0 - tol) * base, (2.0 + tol) * base
+    m2x = (lp_map >= lo) & (lp_map <= hi)
+    return m2x.astype(np.uint8), float(base)
+
+
+def banding_scores(lp_map: np.ndarray, axis_hint: str | None = None, tol: float = 0.2) -> dict:
+    """
+    Находит «полосы удвоения» вдоль строк/столбцов:
+      - строит карту 2×-пикселей
+      - агрегирует долю 2× по каждой строке и столбцу
+      - оценивает 'полосатость' как max сглаженной доли и длину длиннейшего кластера > thr
+    Возвращает метрики + карту-индикатор (для визуализации).
+    """
+    H, W = lp_map.shape
+    m2x, base = _make_2x_mask(lp_map, tol=tol)
+
+    with np.errstate(invalid="ignore"):
+        row_frac = np.nanmean(m2x, axis=1)  # H
+        col_frac = np.nanmean(m2x, axis=0)  # W
+    row_frac = np.nan_to_num(row_frac, nan=0.0)
+    col_frac = np.nan_to_num(col_frac, nan=0.0)
+
+    def smooth(v: np.ndarray, k: int = 9) -> np.ndarray:
+        if k <= 1:
+            return v
+        k = min(k, len(v) // 2 * 2 + 1)
+        pad = k // 2
+        w = np.ones(k, dtype=np.float32) / k
+        return np.convolve(np.pad(v, (pad, pad), mode="edge"), w, mode="valid")
+
+    row_s = smooth(row_frac, k=max(5, H // 32))
+    col_s = smooth(col_frac, k=max(5, W // 32))
+
+    row_band_score = float(row_s.max()) if len(row_s) else 0.0
+    col_band_score = float(col_s.max()) if len(col_s) else 0.0
+
+    def max_run(v: np.ndarray, thr: float = 0.35) -> int:
+        best = cur = 0
+        for x in v:
+            if x >= thr:
+                cur += 1
+            else:
+                best = max(best, cur)
+                cur = 0
+        best = max(best, cur)
+        return int(best)
+
+    row_max_run = max_run(row_s, thr=0.35)
+    col_max_run = max_run(col_s, thr=0.35)
+
+    if axis_hint is None:
+        axis_info = detect_perspective_axis(lp_map)
+        axis_hint = "rows" if axis_info["axis"] == "y" else "cols"
+
+    band_score = row_band_score if axis_hint == "rows" else col_band_score
+    max_run_val = row_max_run if axis_hint == "rows" else col_max_run
+
+    indicator = np.zeros((H, W), np.float32)
+    if axis_hint == "rows":
+        for y in range(H):
+            indicator[y, :] = row_frac[y]
+    else:
+        for x in range(W):
+            indicator[:, x] = col_frac[x]
+
+    return {
+        "axis_hint": axis_hint,
+        "base_period_px": base,
+        "row_frac_max": row_band_score,
+        "col_frac_max": col_band_score,
+        "row_max_run": row_max_run,
+        "col_max_run": col_max_run,
+        "band_score": band_score,
+        "max_run": max_run_val,
+        "indicator": indicator,
+    }
 
 
 # ---------------------------- plotting ---------------------------------------
 def imsave(path, arr, cmap="gray", vmin=None, vmax=None):
-    plt.figure(figsize=(6,5)); plt.axis("off")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    plt.figure(figsize=(6, 5))
+    plt.axis("off")
     plt.imshow(arr, cmap=cmap, vmin=vmin, vmax=vmax)
-    plt.tight_layout(); plt.savefig(path, dpi=140); plt.close()
+    plt.tight_layout()
+    plt.savefig(path, dpi=140)
+    plt.close()
 
 
 def plot_radial_profile(path, radii, prof, r_star):
-    plt.figure(figsize=(6,4))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    plt.figure(figsize=(6, 4))
     plt.plot(radii, prof, label="log-amp radial")
     plt.axvline(r_star, color="r", linestyle="--", label="f*")
-    plt.axvline(2*r_star, color="orange", linestyle=":", label="2f*")
-    plt.axvline(0.5*r_star, color="green", linestyle=":", label="0.5f*")
-    plt.xlabel("радиус частоты (бин FFT)"); plt.ylabel("усреднённая log-амплитуда")
-    plt.legend(); plt.tight_layout(); plt.savefig(path, dpi=140); plt.close()
+    plt.axvline(2 * r_star, color="orange", linestyle=":", label="2f*")
+    plt.axvline(0.5 * r_star, color="green", linestyle=":", label="0.5f*")
+    plt.xlabel("радиус частоты (бин FFT)")
+    plt.ylabel("усреднённая log-амплитуда")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(path, dpi=140)
+    plt.close()
+
+
+def save_banding_map(path: str, indicator: np.ndarray):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    plt.figure(figsize=(6, 5))
+    plt.axis("off")
+    plt.imshow(indicator, cmap="inferno", vmin=0.0, vmax=1.0)
+    plt.colorbar(fraction=0.046, pad=0.04, label="доля 2× по линии")
+    plt.tight_layout()
+    plt.savefig(path, dpi=140)
+    plt.close()
 
 
 # ---------------------------- CLI --------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pred", required=True, help="путь к изображению с заменённой текстурой")
-    ap.add_argument("--ref",  default=None, help="опционально: эталонный тайловый патч")
+    ap.add_argument("--ref", default=None, help="опционально: эталонный тайловый патч")
     ap.add_argument("--mask", default=None, help="опционально: PNG-маска стены (белое — стена)")
-    ap.add_argument("--out",  required=True, help="папка для отчёта")
+    ap.add_argument("--out", required=True, help="папка для отчёта")
     ap.add_argument("--device", default="cpu")
     args = ap.parse_args()
 
@@ -280,12 +439,13 @@ def main():
     C, H, W = pred.shape
     mask = load_mask(args.mask, H, W).to(torch.float32)
     y_pred = rgb_to_luma(pred).to(args.device)
-    mask   = mask.to(args.device)
+    mask = mask.to(args.device)
 
     # 1) Глобальный спектр с/без окна, радиальный профиль
     y0 = (y_pred * mask).to(args.device)
     A0 = fft_amp(y0)
     imsave(os.path.join(args.out, "fft_log_nohann.png"), torch.log1p(A0).cpu().numpy())
+
     y_h = y0 * hann2d(H, W, device=y0.device, dtype=y0.dtype)
     A_h = fft_amp(y_h)
     imsave(os.path.join(args.out, "fft_log_hann.png"), torch.log1p(A_h).cpu().numpy())
@@ -295,7 +455,8 @@ def main():
     plot_radial_profile(os.path.join(args.out, "radial_profile.png"), r_bins, prof, r_star)
 
     # метрики энергий на гармониках и осевой крест
-    Ef, E2f, Ehf = energy_at_radius(torch.log1p(A_h), r_star, cfg.ring_width, torch.from_numpy(r_bins).to(A_h.device))
+    Ef, E2f, Ehf = energy_at_radius(torch.log1p(A_h), r_star, cfg.ring_width,
+                                    torch.from_numpy(r_bins).to(A_h.device))
     axis_ratio = axis_energy_ratio(A_h, r_star, cfg.ring_width)
 
     # 2) ACF и период
@@ -306,6 +467,10 @@ def main():
     lp_map, lp_cov = local_period_map(y_pred, mask, cfg)
     imsave(os.path.join(args.out, "local_period_px.png"), lp_map, cmap="viridis")
     imsave(os.path.join(args.out, "local_mask_coverage.png"), lp_cov, cmap="plasma")
+
+    # 3b) Полосы удвоения поперёк перспективы
+    band = banding_scores(lp_map, axis_hint=None, tol=0.2)
+    save_banding_map(os.path.join(args.out, "local_period_bands.png"), band["indicator"])
 
     # 4) Сдвиговая чувствительность и sanity ресайза
     mse_dx = roll_mse(y_pred, mask, dx=1, dy=0)
@@ -333,10 +498,21 @@ def main():
         "resize_mse_downUp": mse_resize,
         "resize_delta_r": dr,
         "ref_radius_bin": r_ref,
+        # banding
+        "perspective_axis": "y_if_rows_else_x",
+        "band_axis_hint": band["axis_hint"],
+        "band_base_period_px": band["base_period_px"],
+        "band_row_frac_max": band["row_frac_max"],
+        "band_col_frac_max": band["col_frac_max"],
+        "band_row_max_run": band["row_max_run"],
+        "band_col_max_run": band["col_max_run"],
+        "band_score": band["band_score"],
+        "band_max_run": band["max_run"],
         "notes": {
             "high_axis_ratio_hint": "высокие значения -> осевой «крест»/краевые эффекты FFT",
             "high_E2f_over_Ef_hint": "больше 1.0 -> модель «садится» на 2f (удвоение шага)",
             "high_shift_mse_hint": "сильная сдвиговая неинвариантность (alias/stride)",
+            "banding_hint": "высокие band_score/max_run -> полосы 2× поперёк направления перспективы",
         }
     }
     with open(os.path.join(args.out, "summary.json"), "w", encoding="utf-8") as f:
@@ -344,8 +520,8 @@ def main():
 
     # превью
     imsave(os.path.join(args.out, "pred.png"),
-           (pred.permute(1,2,0).cpu().numpy() if C==3 else pred.squeeze().cpu().numpy()),
-           cmap=None if C==3 else "gray")
+           (pred.permute(1, 2, 0).cpu().numpy() if C == 3 else pred.squeeze().cpu().numpy()),
+           cmap=None if C == 3 else "gray")
 
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
@@ -365,11 +541,11 @@ def run_diagnostics_from_tensors(
     Возвращает словарь метрик (для логгера).
     """
     os.makedirs(out_dir, exist_ok=True)
-    x = pred_bchw[0].detach().clamp(0,1).cpu()          # C×H×W
-    C,H,W = x.shape
-    m = (mask_bchw[0].detach().clamp(0,1).cpu()
-         if mask_bchw is not None else torch.ones(1,H,W))
-    y = rgb_to_luma(x)                                  # 1×H×W
+    x = pred_bchw[0].detach().clamp(0, 1).cpu()  # C×H×W
+    C, H, W = x.shape
+    m = (mask_bchw[0].detach().clamp(0, 1).cpu()
+         if mask_bchw is not None else torch.ones(1, H, W))
+    y = rgb_to_luma(x)  # 1×H×W
 
     # FFT с/без окна, профиль, фундаментал
     A0 = fft_amp(y * m)
@@ -382,7 +558,8 @@ def run_diagnostics_from_tensors(
     r_star, (r_bins, prof) = estimate_fundamental(y, m, cfg, use_hann=True)
     plot_radial_profile(os.path.join(out_dir, "radial_profile.png"), r_bins, prof, r_star)
 
-    Ef,E2f,Ehf = energy_at_radius(torch.log1p(Ah), r_star, cfg.ring_width, torch.from_numpy(r_bins))
+    Ef, E2f, Ehf = energy_at_radius(torch.log1p(Ah), r_star, cfg.ring_width,
+                                    torch.from_numpy(r_bins))
     axis_ratio = axis_energy_ratio(Ah, r_star, cfg.ring_width)
 
     r_acf, acf = acf_period(y, m, cfg)
@@ -391,6 +568,10 @@ def run_diagnostics_from_tensors(
     lp_map, lp_cov = local_period_map(y, m, cfg)
     imsave(os.path.join(out_dir, "local_period_px.png"), lp_map, cmap="viridis")
     imsave(os.path.join(out_dir, "local_mask_coverage.png"), lp_cov, cmap="plasma")
+
+    # Полосы удвоения поперёк перспективы
+    band = banding_scores(lp_map, axis_hint=None, tol=0.2)
+    save_banding_map(os.path.join(out_dir, "local_period_bands.png"), band["indicator"])
 
     mse_dx = roll_mse(y, m, dx=1, dy=0)
     mse_dy = roll_mse(y, m, dx=0, dy=1)
@@ -411,6 +592,16 @@ def run_diagnostics_from_tensors(
         "resize_mse_downUp": mse_resize,
         "resize_delta_r": dr,
         "ref_radius_bin": r_ref,
+        # banding
+        "perspective_axis": "y_if_rows_else_x",
+        "band_axis_hint": band["axis_hint"],
+        "band_base_period_px": band["base_period_px"],
+        "band_row_frac_max": band["row_frac_max"],
+        "band_col_frac_max": band["col_frac_max"],
+        "band_row_max_run": band["row_max_run"],
+        "band_col_max_run": band["col_max_run"],
+        "band_score": band["band_score"],
+        "band_max_run": band["max_run"],
     }
     with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
@@ -423,10 +614,14 @@ def run_diagnostics_from_tensors(
             "shift_mse_dx1": summary["shift_mse_dx1"],
             "shift_mse_dy1": summary["shift_mse_dy1"],
             "resize_delta_r": summary["resize_delta_r"],
+            "band_score": summary["band_score"],
+            "band_max_run": summary["band_max_run"],
         }, global_step)
-        writer.add_image(f"{tag_prefix}/fft_log_hann", torch.log1p(Ah)[None, ...], global_step, dataformats="CHW")
+        writer.add_image(f"{tag_prefix}/fft_log_hann", torch.log1p(Ah)[None, ...],
+                         global_step, dataformats="CHW")
         writer.add_image(f"{tag_prefix}/local_period_px",
-                         torch.from_numpy(lp_map)[None, None, ...], global_step, dataformats="NCHW")
+                         torch.from_numpy(lp_map)[None, None, ...],
+                         global_step, dataformats="NCHW")
 
     return summary
 
