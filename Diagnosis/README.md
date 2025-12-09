@@ -2,25 +2,19 @@
 
 ## 1. Введение
 
-Этот документ описывает систему диагностики повторяющихся артефактов
-(двойного тайлинга, вертикальных/горизонтальных "столбиков" ошибок и
-др.), возникающих при обучении LoRA и других модификаций диффузионных
-моделей. Документация соответствует скрипту-диагносту, генерируемому в
-проекте Diffusion Loss.
+Инструмент для поиска и подтверждения причин артефактов тайлинга (удвоение шага, «столбики/строки», alias/moire) при замене материалов на стенах. Скрипт строит спектральные и корреляционные карты, считает метрики и сохраняет понятный отчёт (PNG + JSON). Подходит и для одиночных изображений, и для периодического вызова прямо из кода обучения.
 
 ## 2. Что диагностируем
 
-Скрипт выявляет:
+1. «Кучкование» артефактов строго по строкам/столбцам очень похоже на сетчатые артефакты апсемплинга (transposed-conv / sub-pixel), известные как checkerboard artifacts. Они возникают из-за неравномерных перекрытий ядер при апсемплинге; типичный фикс — заменить на resize-conv (Nearest/Bilinear → Conv) или подогнать кратность ядра и шага.
+**Симптомы:** артефакты идут «по клетке», узор «срывается» вдоль чётных строк/столбцов.
+2. Удвоение шага — классическая путаница фундаментальной частоты с гармониками (модель «садится» на 2f или ½f вместо f), усугубляемая утечкой спектра и краевыми эффектами FFT. Проверяется через ACF/радиальный спектр/цепстр.
+**Симптомы:** «плитка в два раза длиннее/короче», часто зонами; на спектре — пик на 2f сильнее f.
 
--   Паттерны удвоения шага тайлинга.
--   Склонность ошибок «кучковаться» в строки/столбцы.
--   Локальные высокочастотные шумы, появляющиеся при подмене материала
-    стен/поверхностей.
--   Несогласованность распределений латентных признаков между batch-ами.
--   Аномальное поведение лоссов --- всплески, затяжные «полки»,
-    расхождение с EMA.
--   Потенциальные проблемы датасета (тайлинг исходных текстур, неверная
-    подготовка масок, смещения в кропах).
+4. Алиасинг/moire при ресайзе (даунсемплирование без низкочастотной фильтрации) рождает регулярные «усреднённые» ряды/колонки и «неправильные» периоды. Для CNN и диффузий это проявляется как сдвиговая неинвариантность из-за страйдов и пуллинга без антиалиаса (лечится blur-pool/антиалиасом перед даунсэмплом).
+5. раевые эффекты в 2D-FFT (предположение периодичности кадра) дают осевой «крест» энергии, что подталкивает модель к осевым деформациям и столбикам/строкам. Лечится аподизацией (окна Ханна/Тьюки) или Periodic-plus-Smooth перед спектральными вычислениями.
+
+   ***Пункты 1 и 3 - скорее всего чушь, т.к. чистый MSE дает совсем другие проблемы, но на всякий случай оставил, вдруг там тоже, что-то обнаружим.***
 
 ## 3. Методология диагностики
 
@@ -125,4 +119,17 @@ if step % config.diag_interval == 0:
 
 ## 9. Лицензия
 
-MIT License
+| Key                                   | Meaning                                                                  | How to read it                                                                                                           |
+| ------------------------------------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
+| `fundamental_radius_bin`              | Estimated **f*** (radial bin in FFT) from the Hann-windowed log-spectrum | Baseline spatial frequency                                                                                               |
+| `acf_first_peak_radius_bin`           | First significant ACF peak (via PSD→ACF)                                 | Should match **f***; divergence hints a harmonic mix-up (½f or 2f). Wiener–Khinchin grounds this check. ([Википедия][1]) |
+| `E2f_over_Ef`, `Ehalf_over_Ef`        | Energy around **2f*** and **0.5f*** relative to **f***                   | > 1 ⇒ the model latched onto a harmonic (visual “tile size ×2” / “½”).                                                   |
+| `axis_ratio_at_f`                     | Axis energy (horizontal/vertical) within the ring at **f***              | High ⇒ “axis cross” from boundary/periodicity mismatch; explains row/column banding.                                     |
+| `shift_mse_dx1`, `shift_mse_dy1`      | MSE between prediction and its 1-px shift                                | High ⇒ shift non-invariance (aliasing). Use anti-alias downsampling / BlurPool. ([arXiv][2])                             |
+| `resize_mse_downUp`, `resize_delta_r` | Damage and **f*** drift after down→up (AA)                               | Large ⇒ resize pipeline introduces moiré/aliasing; ensure antialiasing is enabled. ([docs.pytorch.org][3])               |
+| `ref_radius_bin`                      | **f*** for your reference tile                                           | Compare with `fundamental_radius_bin` to judge scale accuracy                                                            |
+
+[1]: https://en.wikipedia.org/wiki/Wiener%E2%80%93Khinchin_theorem?utm_source=chatgpt.com "Wiener–Khinchin theorem"
+[2]: https://arxiv.org/abs/1904.11486?utm_source=chatgpt.com "Making Convolutional Networks Shift-Invariant Again"
+[3]: https://docs.pytorch.org/vision/stable/generated/torchvision.transforms.Resize.html?utm_source=chatgpt.com "Resize — Torchvision 0.24 documentation"
+
