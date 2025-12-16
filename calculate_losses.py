@@ -1,7 +1,3 @@
-    # Функция подсчета лоссов.
-    # Тут куча всякой мешанины, тк очень много чего перечитано и перепробовано. На данный момент текущие результаты 
-    # получаются именно при использовании данной функции подсчетов.
-    
     def calculate_loss(
             self,
             noise_pred: torch.Tensor,
@@ -444,6 +440,8 @@
                 "SpectralPeriodLoss",
                 "LogPolarAlignLoss",
                 "ScaleConsistencyLoss",
+                "Phase",
+                "local"
             )
         ):
             vae = self.sd.vae
@@ -452,6 +450,9 @@
             tgt_latents_vae = batch.latents.to(vae.device, dtype=vae.dtype)
 
             alpha = 0.1
+
+            step = self.current_step
+            warmup_steps = 2000
 
             latents_for_pred = batch.latents.to(
                 noise_pred.device, dtype=noise_pred.dtype
@@ -476,7 +477,7 @@
                 proj = torch.cat([noise_pred, pad], dim=1)
 
             pred_latents_vae = (latents_for_pred + alpha * proj).to(
-                vae.device, dtype=vae.dtype
+                vae.device, dtype=vae.dtype 
             )
 
             pred_imgs = vae.decode(pred_latents_vae / scaling_factor).sample
@@ -487,6 +488,7 @@
             tgt_imgs = tgt_imgs.float()
 
             if batch.mask_tensor is not None and len(pred_imgs.shape) == 4:
+                print('mask_full')
                 mask_img = batch.mask_tensor.to(
                     vae.device, dtype=pred_imgs.dtype
                 )
@@ -498,6 +500,7 @@
                 )
             else:
                 if len(pred_imgs.shape) == 4:
+                    print('mask_one')
                     mask_img = torch.ones(
                         pred_imgs.shape[0],
                         1,
@@ -509,34 +512,54 @@
                 else:
                     mask_img = None
 
+
+            
             if mask_img is not None:
                 mask_img = mask_img.float()
-
+                beta = min(1.0, float(step) / float(warmup_steps))
+                final_beta = self.train_config.min_beta + beta * (self.train_config.max_beta - self.train_config.min_beta)
                 if self.train_config.texture_loss == "custom":
                     print("custom with coef")
-                    print(self.train_config.loss_coef)
-                    print(self.train_config.loss_Spect_coef)
                     tex_sp = self.spectral_period_loss(pred_imgs, tgt_imgs, mask_img)
                     tex_lp = self.logpolar_loss(pred_imgs, tgt_imgs, mask_img)
                     tex_acf = self.acf_period_loss(pred_imgs, tgt_imgs, mask_img)
-                    additional_loss = additional_loss + (self.train_config.loss_Spect_coef * tex_sp + self.train_config.loss_Log_coef * tex_lp + self.train_config.loss_AFC_coef * tex_acf)
-
+                    tex_ph = self.phase_loss(pred_imgs, tgt_imgs, mask_img)
+                    additional_loss = additional_loss + (self.train_config.loss_Spect_coef * tex_sp + self.train_config.loss_Log_coef * tex_lp + self.train_config.loss_AFC_coef * tex_acf + self.train_config.loss_Phase_coef * tex_ph)
+                    if step % 50 == 0:  # лог
+                        diag = self.phase_loss.diagnostics(pred_imgs, tgt_imgs, mask_img)
+                        print(
+                            f"[step {step}] PCL diag: "
+                            f"center_prob={diag['center_prob']:.3f}  PCE={diag['PCE']:.2f}"
+                        )
+                elif self.train_config.texture_loss == "Phase":
+                    print("Phase")
+                    tex_ph = self.phase_loss(pred_imgs, tgt_imgs, mask_img)
+                    additional_loss = additional_loss + tex_ph
+                    if step % 50 == 0:  # лог
+                        diag = self.phase_loss.diagnostics(pred_imgs, tgt_imgs, mask_img)
+                        print(
+                            f"[step {step}] PCL diag: "
+                            f"center_prob={diag['center_prob']:.3f}  PCE={diag['PCE']:.2f}")
                 elif self.train_config.texture_loss == "SpectralPeriodLoss":
                     print("SpectralPeriodLoss")
-                    print(self.train_config.loss_Spect_coef)
                     tex_sp = self.spectral_period_loss(pred_imgs, tgt_imgs, mask_img)
-                    additional_loss = additional_loss + self.train_config.loss_Spect_coef * tex_sp
+                    additional_loss = additional_loss +  tex_sp
 
                 elif self.train_config.texture_loss == "LogPolarAlignLoss":
                     print("LogPolarAlignLoss")
-                    print(self.train_config.loss_Log_coef)
                     tex_lp = self.logpolar_loss(pred_imgs, tgt_imgs, mask_img)
-                    additional_loss = additional_loss + self.train_config.loss_Log_coef * tex_lp
+                    additional_loss = additional_loss + tex_lp
 
                 elif self.train_config.texture_loss == "ACFPeriodLoss":
                     print("ACFPerdiodLoss")
-                    print(self.train_config.loss_AFC_coef)
                     tex_acf = self.acf_period_loss(pred_imgs, tgt_imgs, mask_img)
-                    additional_loss = additional_loss + self.train_config.loss_AFC_coef * tex_acf
+                    additional_loss = additional_loss + tex_acf
 
-        return loss + self.train_config.loss_coef * additional_loss
+                elif self.train_config.texture_loss == "local":
+                    print("local")
+                    tex_local = self.local_texture_loss(pred_imgs, tgt_imgs, mask_img)
+                    additional_loss = additional_loss + tex_local
+                print(f"BETA: {final_beta}")
+                print(f"LOSS {loss} and {additional_loss}")
+                return loss + final_beta * additional_loss
+        return loss
