@@ -156,16 +156,23 @@ def feather(mask: torch.Tensor, ksize: int = 7) -> torch.Tensor:
     return m.clamp(0, 1)
 
 
-def fft_amp(img: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+def fft_amp(img: torch.Tensor,
+            mask: Optional[torch.Tensor] = None,
+            normalize: bool = True) -> torch.Tensor:
     """
     Амплитуда 2D-FFT (fftshift). img: Bx1xHxW -> Bx1xHxW (амплитуда).
     """
-    if mask is not None:
-        img = img * feather(mask, ksize=7)
+    if normalize:
+        img = normalize_for_fft(img, mask)
+    else:
+        if mask is not None:
+            img = img * feather(mask, ksize=7)
+
     F2 = torch.fft.fft2(img.squeeze(1), norm="ortho")
     F2 = torch.fft.fftshift(F2, dim=(-2, -1))
     A = (F2.real ** 2 + F2.imag ** 2 + _EPS).sqrt()
     return A.unsqueeze(1)
+
 
 
 def radial_profile(mag: torch.Tensor, r_bins: int = 256, min_bin: int = 2,
@@ -256,3 +263,45 @@ def log_polar_map(mag: torch.Tensor, out_r: int = 128, out_t: int = 180, r_min: 
         align_corners=True  # фиксируем для стабильной геометрии
     )
     return lp
+
+
+
+def normalize_for_fft(img: torch.Tensor,
+                      mask: Optional[torch.Tensor] = None,
+                      eps: float = _EPS,
+                      do_mean: bool = True,
+                      do_rms: bool = True) -> torch.Tensor:
+    """
+    Нормализация перед FFT:
+    - вычитание среднего (DC removal)
+    - деление на RMS (контраст), чтобы спектр меньше зависел от освещения/экспозиции
+    Всё дифференцируемо.
+    img: Bx1xHxW
+    mask: Bx1xHxW (опционально)
+    """
+    if mask is None:
+        x = img
+        if do_mean:
+            x = x - x.mean(dim=(-2, -1), keepdim=True)
+        if do_rms:
+            rms = x.pow(2).mean(dim=(-2, -1), keepdim=True).sqrt()
+            x = x / (rms + eps)
+        return x
+
+    # Важно: используем аподизацию как "веса" для статистик
+    w = feather(mask, ksize=7)
+    denom = w.sum(dim=(-2, -1), keepdim=True).clamp_min(eps)
+
+    if do_mean:
+        mu = (img * w).sum(dim=(-2, -1), keepdim=True) / denom
+        x = img - mu
+    else:
+        x = img
+
+    if do_rms:
+        var = (x.pow(2) * w).sum(dim=(-2, -1), keepdim=True) / denom
+        x = x / (var.sqrt() + eps)
+
+    # И только после нормализации применяем окно (как вы и делали)
+    return x * w
+
