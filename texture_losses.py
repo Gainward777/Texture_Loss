@@ -77,9 +77,12 @@ class SpectralPeriodLoss(torch.nn.Module):
         mask: torch.Tensor,
         center_override: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        #experimental correcting
+        pred_0 = (pred / 2 + 0.5).clamp(0, 1)
+        tgt_0  = (target / 2 + 0.5).clamp(0, 1)
         # Переводим в яркость
-        I = rgb_to_luma(pred)
-        T = rgb_to_luma(target)
+        I = rgb_to_luma(pred_0)
+        T = rgb_to_luma(tgt_0)
 
         # Амплитудные спектры
         A_pred = fft_amp(I, mask)
@@ -139,8 +142,11 @@ class LogPolarAlignLoss(torch.nn.Module):
         self.out_r, self.out_t, self.r_min, self.w = out_r, out_t, r_min, w
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        I = rgb_to_luma(pred)
-        T = rgb_to_luma(target)
+        #experimental correcting
+        pred_0 = (pred / 2 + 0.5).clamp(0, 1)
+        tgt_0  = (target / 2 + 0.5).clamp(0, 1)
+        I = rgb_to_luma(pred_0)
+        T = rgb_to_luma(tgt_0)
         A_pred = fft_amp(I, mask)
         A_tgt = fft_amp(T, mask)
         LPg = log_polar_map(A_pred, self.out_r, self.out_t, self.r_min)
@@ -163,7 +169,10 @@ class ScaleConsistencyLoss(torch.nn.Module):
 
     def forward(self, pred1: torch.Tensor, pred2: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         def _f(pred):
-            I = rgb_to_luma(pred)
+            #experimental correcting
+            pred_0 = (pred / 2 + 0.5).clamp(0, 1)
+            
+            I = rgb_to_luma(pred_0)
             A = fft_amp(I, mask)
             S = radial_profile(A, self.r_bins, self.min_bin,
                                self.max_bin if self.max_bin is not None else self.r_bins - 1)
@@ -189,7 +198,10 @@ class ACFPeriodLoss(torch.nn.Module):
         self.w = w
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        I = rgb_to_luma(pred); T = rgb_to_luma(target)
+        #experimental correcting
+        pred_0 = (pred / 2 + 0.5).clamp(0, 1)
+        tgt_0  = (target / 2 + 0.5).clamp(0, 1)
+        I = rgb_to_luma(pred_0); T = rgb_to_luma(tgt_0)
         Cg = autocorr_map(I, mask)  # Bx1xHxW
         Ct = autocorr_map(T, mask)
         Sg = radial_profile(Cg.abs(), r_bins=self.r_bins, min_bin=1, max_bin=self.r_bins - 1, log_scale=False)
